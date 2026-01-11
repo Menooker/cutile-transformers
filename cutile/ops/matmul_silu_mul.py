@@ -45,7 +45,7 @@ def matmul_silu_mul(a, b1, b2, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[
 
 def launch_matmul_silu_mul(a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
     stream = torch.cuda.current_stream()
-    tile_m, tile_n, tile_k = 64, 64, 64
+    tile_m, tile_n, tile_k = 128, 64, 64
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     assert b1.shape == (N, K)
@@ -55,11 +55,14 @@ def launch_matmul_silu_mul(a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, 
             matmul_silu_mul,
             (a, b1, b2, c, tile_m, tile_n, tile_k, approx))
 
+#qwen2 
+#launch_matmul_silu_mul torch.Size([1, 1536]) torch.Size([8960, 1536])
+
 def test():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k = 128, 64, 128
+    tile_m, tile_n, tile_k = 128, 64, 64
     M, N, K = 4096, 4096, 4096
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     print("Grid size:", grid)
@@ -79,6 +82,15 @@ def test():
             grid,  # 1D grid of processors
             matmul_silu_mul,
             args)
+    start = time.time()
+    for _ in range(10):
+        ct.launch(stream,
+                grid,  # 1D grid of processors
+                matmul_silu_mul,
+                args)
+    torch.cuda.synchronize()
+    end = time.time()
+    print(f"matmul_silu_mul kernel time for 10 runs: {end - start:.4f} seconds")
 
     c1 = torch.matmul(a, b1.T)
     c2 = torch.matmul(a, b2.T)

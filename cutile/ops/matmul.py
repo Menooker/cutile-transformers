@@ -51,6 +51,9 @@ def launch_matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=Fals
             matmul,
             (a, b, c, tile_m, tile_n, tile_k, transb, act))
 
+# qwen2
+#launch_matmul torch.Size([1, 8960]) torch.Size([1536, 8960])
+
 def test():
     import time
     import torch
