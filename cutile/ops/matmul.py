@@ -7,6 +7,54 @@ ACT_RELU = 1
 ACT_SILU = 2
 ACT_NONE = 0
 
+ConstInt = ct.Constant[int]
+
+@ct.kernel(occupancy=ct.ByTarget(sm_120=8))
+def gemv_split_k_kernel(A, B, C, LOCKS, COUNTS,
+                          tn: ConstInt, tk: ConstInt,
+                          SPLIT_K: ConstInt):
+    GROUP_SIZE_M = 1
+    M = 1
+    N = B.shape[1]
+    bidx, bidy = 0, ct.bid(0)
+    bidz = ct.bid(1)
+    fake_tm = 16
+    num_tiles_k = ct.num_tiles(A, axis=1, shape=(1, tk))
+    sum = ct.full((fake_tm, tn), 0, dtype=ct.float32)
+    zero_pad = ct.PaddingMode.ZERO
+
+    # Convert fp32 to tf32 to use tensorcore
+    dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
+    split_size = ct.cdiv(num_tiles_k, SPLIT_K)
+    for k in range(bidz * split_size, bidz * split_size + split_size, 1):
+        a = ct.load(A, index=(bidx, k), shape=(fake_tm, tk),
+                    padding_mode=zero_pad).astype(dtype)
+        b = ct.load(B, index=(bidy, k), shape=(tn, tk),
+                    padding_mode=zero_pad).astype(dtype)
+        b = ct.transpose(b)
+        sum = ct.mma(a, b, sum)
+    sum = ct.extract(sum, index=(0, 0), shape=(1, tn))
+    sum = ct.reshape(sum, (tn,))
+    sum = ct.astype(sum, C.dtype)
+    lock_offset = ct.bid(0)
+    count_offset = lock_offset
+    C_offset = ct.arange(tn, dtype=ct.int32)
+    C_offset = C_offset + bidy * tn
+    C_offset_0 = ct.full((tn), 0, dtype=ct.int32)
+    while ct.atomic_cas(LOCKS, lock_offset, 0, 1, memory_order=ct.MemoryOrder.ACQUIRE) == 1:
+        pass
+    count = ct.gather(COUNTS, count_offset)
+    if count == 0:
+        ct.scatter(C, (C_offset_0, C_offset), sum)
+        #ct.store(C, index=(bidx, bidy), tile=sum)
+    else:
+        # curr = ct.load(C, index=(bidx, bidy), shape=(1, tn))
+        # ct.store(C, index=(bidx, bidy), tile=(curr + sum))
+        curr = ct.gather(C, (C_offset_0, C_offset))
+        ct.scatter(C, (C_offset_0, C_offset), curr + sum)
+    ct.scatter(COUNTS, count_offset, (count + 1) % SPLIT_K)
+    ct.atomic_xchg(LOCKS, lock_offset, 0, memory_order=ct.MemoryOrder.RELEASE)
+
 
 @ct.kernel(occupancy=ct.ByTarget(sm_120=8))
 def matmul(a, b, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: ct.Constant[int], transb: ct.Constant[bool], act: ct.Constant[int]):
@@ -72,7 +120,7 @@ def test():
     #benchmark this
 
     stream = torch.cuda.current_stream()
-    args = (a, b, c, tile_m, tile_n, tile_k, False)
+    args = (a, b, c, tile_m, tile_n, tile_k, False, 0)
     ct.launch(stream,
             grid,  # 1D grid of processors
             matmul,
@@ -102,13 +150,13 @@ def test():
     ct.launch(stream,
             grid,  # 1D grid of processors
             matmul,
-            (a, b, c, tile_m, tile_n, tile_k, True))
+            (a, b, c, tile_m, tile_n, tile_k, True, 0))
     start = time.time()
     for _ in range(10):
         ct.launch(stream,
                 grid,  # 1D grid of processors
                 matmul,
-                (a, b, c, tile_m, tile_n, tile_k, True))
+                (a, b, c, tile_m, tile_n, tile_k, True, 0))
     torch.cuda.synchronize()
     total = (time.time() - start)/10
 
@@ -126,5 +174,54 @@ def test():
     print("✓ matmul_example passed!")
 
 
+def test_gemv():
+    import time
+    import torch
+    # Create input data
+    tile_m, tile_n, tile_k = 16, 64, 128
+    split_k = 16
+    M, N, K = 1, 1536, 8960
+    grid = (ceil(M/tile_m) * ceil(N/tile_n), split_k, 1)
+    print("Grid size:", grid)
+
+    a = torch.rand((M, K), device='cuda', dtype=torch.bfloat16)
+    b = torch.rand((N, K), device='cuda', dtype=torch.bfloat16)
+    c = torch.zeros((M, N), device='cuda', dtype=torch.bfloat16)
+
+    locks = torch.zeros((grid[0]), device='cuda', dtype=torch.int32)
+    counts = torch.zeros((grid[0]), device='cuda', dtype=torch.int32)
+
+    # Launch kernel
+
+    #benchmark this
+
+    stream = torch.cuda.current_stream()
+    args = (a, b, c, locks, counts, tile_n, tile_k, split_k)
+    ct.launch(stream,
+            grid,  # 1D grid of processors
+            gemv_split_k_kernel,
+            args)
+    start = time.time()
+    for _ in range(10):
+        ct.launch(stream,
+                grid,  # 1D grid of processors
+                gemv_split_k_kernel,
+                args)
+    torch.cuda.synchronize()
+    total = (time.time() - start)/10
+    print(f"Kernel execution time: {total*1000:.4f} ms")
+
+    expected = torch.matmul(a, b.T)
+    start = time.time()
+    for _ in range(10):
+        expected = torch.matmul(a, b.T)
+    torch.cuda.synchronize()
+    total = (time.time() - start)/10
+    print(f"PyTorch matmul execution time: {total*1000:.4f} ms")
+    torch.testing.assert_close(c, expected)
+    print("✓ matmul_split_k passed!")
+
+
 if __name__ == "__main__":
-    test()
+    # test()
+    test_gemv()
