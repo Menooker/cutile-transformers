@@ -27,8 +27,11 @@ def gemv_split_k_kernel(A, B, C, LOCKS, COUNTS,
     dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
     split_size = ct.cdiv(num_tiles_k, SPLIT_K)
     for k in range(bidz * split_size, bidz * split_size + split_size, 1):
+        a_k_offset = (ct.arange(tk, dtype=ct.int32) + k * tk)
         a = ct.load(A, index=(bidx, k), shape=(fake_tm, tk),
                     padding_mode=zero_pad).astype(dtype)
+        # a = ct.gather(A, (0, a_k_offset)).astype(dtype).reshape((1, tk))
+        # a = ct.broadcast_to(a, (fake_tm, tk))
         b = ct.load(B, index=(bidy, k), shape=(tn, tk),
                     padding_mode=zero_pad).astype(dtype)
         b = ct.transpose(b)
@@ -40,18 +43,14 @@ def gemv_split_k_kernel(A, B, C, LOCKS, COUNTS,
     count_offset = lock_offset
     C_offset = ct.arange(tn, dtype=ct.int32)
     C_offset = C_offset + bidy * tn
-    C_offset_0 = ct.full((tn), 0, dtype=ct.int32)
     while ct.atomic_cas(LOCKS, lock_offset, 0, 1, memory_order=ct.MemoryOrder.ACQUIRE) == 1:
         pass
     count = ct.gather(COUNTS, count_offset)
     if count == 0:
-        ct.scatter(C, (C_offset_0, C_offset), sum)
-        #ct.store(C, index=(bidx, bidy), tile=sum)
+        ct.scatter(C, (0, C_offset), sum)
     else:
-        # curr = ct.load(C, index=(bidx, bidy), shape=(1, tn))
-        # ct.store(C, index=(bidx, bidy), tile=(curr + sum))
-        curr = ct.gather(C, (C_offset_0, C_offset))
-        ct.scatter(C, (C_offset_0, C_offset), curr + sum)
+        curr = ct.gather(C, (0, C_offset))
+        ct.scatter(C, (0, C_offset), curr + sum)
     ct.scatter(COUNTS, count_offset, (count + 1) % SPLIT_K)
     ct.atomic_xchg(LOCKS, lock_offset, 0, memory_order=ct.MemoryOrder.RELEASE)
 
@@ -178,10 +177,10 @@ def test_gemv():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k = 16, 64, 128
+    tile_m, tile_n, tile_k = 1, 64, 256
     split_k = 16
     M, N, K = 1, 1536, 8960
-    grid = (ceil(M/tile_m) * ceil(N/tile_n), split_k, 1)
+    grid = (ceil(N/tile_n), split_k, 1)
     print("Grid size:", grid)
 
     a = torch.rand((M, K), device='cuda', dtype=torch.bfloat16)
