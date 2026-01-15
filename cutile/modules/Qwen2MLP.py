@@ -2,8 +2,8 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-from cutile.ops.matmul_silu_mul import launch_matmul_silu_mul
-from cutile.ops.matmul import launch_matmul
+from cutile.ops.matmul_silu_mul import launch_matmul_silu_mul, launch_gemv_silu_mul
+from cutile.ops.matmul import launch_matmul, launch_gemv
 
 
 class MyQwen2MLP(nn.Module):
@@ -27,9 +27,16 @@ class MyQwen2MLP(nn.Module):
     def forward(self, x):
         batch_size = x.size(0)
         xv = x.view(-1, x.size(-1))
-        v0 = torch.empty((xv.size(0), self.intermediate_size), device=x.device, dtype=torch.float16)
+        M = xv.size(0)
+        v0 = torch.empty((M, self.intermediate_size), device=x.device, dtype=torch.float16)
+        # if M == 1:
+        #     launch_gemv_silu_mul(xv, self.gate_proj.weight, self.up_proj.weight, v0, approx=False)
+        # else:
         launch_matmul_silu_mul(xv, self.gate_proj.weight, self.up_proj.weight, v0, approx=False)
-        finalout = torch.empty((xv.size(0), self.hidden_size), device=x.device, dtype=torch.float16)
+        finalout = torch.empty((M, self.hidden_size), device=x.device, dtype=torch.float16)
+        # if M == 1:
+        #     launch_gemv(v0, self.down_proj.weight, finalout)
+        # else:
         launch_matmul(v0, self.down_proj.weight, finalout, transb=True, act=0)
         return finalout.view(batch_size, -1, self.hidden_size)
 

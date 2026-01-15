@@ -48,6 +48,27 @@ def gemv_split_k_kernel(A, B, C, f32acc, COUNTS,
         ct.scatter(f32acc, (0, C_offset), 0)
         ct.scatter(COUNTS, count_offset, 0)
 
+f32acc = None
+counts = None
+def launch_gemv(a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor):
+    stream = torch.cuda.current_stream()
+    split_k, tile_n, tile_k = 16, 64, 64
+    M, N, K = a.shape[0], c.shape[1], a.shape[1]
+    grid = (ceil(N/tile_n), split_k, 1)
+    assert b1.shape == (N, K)
+    assert M == 1
+
+    global f32acc, counts
+    if f32acc is None or f32acc.shape[1] < N:
+        f32acc = torch.zeros((1, N), device='cuda', dtype=torch.float32)
+    if counts is None or counts.shape[0] < grid[0]:
+        counts = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
+    args = (a, b1, c, f32acc, counts, tile_n, tile_k, split_k)
+    ct.launch(stream,
+            grid,
+            gemv_split_k_kernel,
+            args)
+
 
 
 @ct.kernel(occupancy=ct.ByTarget(sm_120=8))
