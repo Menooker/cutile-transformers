@@ -22,7 +22,7 @@ ConstBool = ct.Constant[bool]
 # --- FMHA Kernel Implementation ---
 @ct.kernel(occupancy=2)
 def fmha_kernel(
-    Q,
+    Q2,
     K,
     V,
     Out,
@@ -65,7 +65,7 @@ def fmha_kernel(
     acc = ct.full((TILE_M, TILE_D), 0.0, dtype=ct.float32)
 
     # Load query tile for this batch, head, and M-chunk
-    q = ct.load(Q, index=(batch_idx, head_idx, bid_x, 0), shape=(1, 1, TILE_M, TILE_D)).reshape(
+    q = ct.load(Q2, index=(batch_idx, bid_x, head_idx, 0), shape=(1, TILE_M, 1, TILE_D)).reshape(
         (TILE_M, TILE_D)
     )  # [TILE_M, TILE_D]
 
@@ -130,14 +130,14 @@ def fmha_kernel(
             shape=(1, 1, TILE_N, TILE_D),
             latency=4,
         ).reshape((TILE_N, TILE_D))  # [TILE_N, TILE_D]
-        p = p.astype(Q.dtype)
+        p = p.astype(Q2.dtype)
         acc = ct.mma(p, v, acc)  # [TILE_M, TILE_N]
         m_i = m_ij  # [TILE_M, 1]
 
     # --- Final Normalization and Store ---
     acc = ct.truediv(acc, l_i, flush_to_zero=True, rounding_mode=RMd.APPROX)
-    acc = acc.reshape((1, 1, TILE_M, TILE_D)).astype(Out.dtype)
-    ct.store(Out, index=(batch_idx, head_idx, bid_x, 0), tile=acc)
+    acc = acc.reshape((1, TILE_M, 1, TILE_D)).astype(Out.dtype)
+    ct.store(Out, index=(batch_idx, bid_x, head_idx, 0), tile=acc)
 
 
 def _fmha_autotune_configs():
@@ -157,7 +157,7 @@ def _fmha_autotune_configs():
 
 def cutile_autotune_fmha(
     stream,
-    q,
+    q2,
     k,
     v,
     o,
@@ -171,13 +171,13 @@ def cutile_autotune_fmha(
     TILE_M=64,
     TILE_N=64,
 ):
-    batch_size, _, q_len, _ = q.shape
+    batch_size, q_len, _, _ = q2.shape
     grid = (math.ceil(q_len / TILE_M), batch_size * num_heads, 1)
     ct.launch(stream,
             grid,  # 1D grid of processors
             fmha_kernel,
             (
-                q,
+                q2,
                 k,
                 v,
                 o,
@@ -203,13 +203,12 @@ def tile_prefill_fmha(q: torch.Tensor, k, v, sm_scale, is_causal=True):
 
     assert num_heads % num_head_kv == 0
     query_group_size = num_heads // num_head_kv
-    print(f"q.is_contiguous(): {q.is_contiguous()} {q.shape} {q.stride()}")
-    print(f"k.is_contiguous(): {k.is_contiguous()}")
-    print(f"v.is_contiguous(): {v.is_contiguous()}")
-    q = q.contiguous() if not q.is_contiguous() else q
+    q2 = q.transpose(1, 2)
+    assert q2.is_contiguous()
+    # q = q.contiguous() if not q.is_contiguous() else q
     k = k.contiguous() if not k.is_contiguous() else k
     v = v.contiguous() if not v.is_contiguous() else v
-    o = torch.empty_like(q)
+    o = torch.empty_like(q2)
 
     input_pos = 0  # prefill, causal
 
@@ -217,7 +216,7 @@ def tile_prefill_fmha(q: torch.Tensor, k, v, sm_scale, is_causal=True):
     EVEN_K = (k_len % max_tile_n) == 0
     return cutile_autotune_fmha(
         torch.cuda.current_stream(),
-        q,
+        q2,
         k,
         v,
         o,

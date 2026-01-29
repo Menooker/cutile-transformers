@@ -40,4 +40,5 @@ def fmha(
         is_causal=is_causal,
         scaling=scaling,
     )
-    return o.transpose(1, 2).contiguous(), None
+    # return o.transpose(1, 2).contiguous(), None
+    return o, None
