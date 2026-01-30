@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import cuda.tile as ct
 import torch
 from cuda.tile import RoundingMode as RMd
+import cuda.tile_experimental as ct_experimental
 
 
 INV_LOG_2 = 1.0 / math.log(2)
@@ -148,7 +149,10 @@ def _fmha_autotune_configs():
 
     if gpu_capability in [(12, 0), (12, 1)]:
         # sm120, sm121
-        yield SimpleNamespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2)
+        all_configs = [SimpleNamespace(TILE_M=TM, TILE_N=TN, num_ctas=1, occupancy=occupancy)
+                for TM in [32, 64] for TN in [32, 64, 128] for occupancy in [1, 2, 4, 8]]
+        for config in all_configs:
+            yield config
     else:
         # sm100 (Blackwell)
         yield SimpleNamespace(TILE_M=256, TILE_N=128, num_ctas=1, occupancy=1)
@@ -191,13 +195,39 @@ def cutile_autotune_fmha(
                 is_causal,
                 EVEN_K,
             ))
+    # ct_experimental.autotune_launch(
+    #     stream,
+    #     grid_fn=lambda cfg: (
+    #         math.ceil(q_len / cfg.TILE_M),
+    #         batch_size * num_heads,
+    #         1,
+    #     ),
+    #     kernel=fmha_kernel,
+    #     args_fn=lambda cfg: (
+    #         q,
+    #         k,
+    #         v,
+    #         o,
+    #         sm_scale,
+    #         input_pos,
+    #         hidden_size,
+    #         num_heads,
+    #         cfg.TILE_M,
+    #         cfg.TILE_N,
+    #         query_group_size,
+    #         is_causal,
+    #         EVEN_K,
+    #     ),
+    #     hints_fn=lambda cfg: {
+    #         "num_ctas": cfg.num_ctas,
+    #         "occupancy": cfg.occupancy,
+    #     },
+    #     search_space=_fmha_autotune_configs,
+    # )
     return o
 
-
-def tile_prefill_fmha(q: torch.Tensor, k, v, sm_scale, is_causal=True):
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(q.size(-1))
-
+_max_tile_n = max(cfg.TILE_N for cfg in _fmha_autotune_configs())
+def fmha_prefill(q: torch.Tensor, k, v, scaling, is_causal=True):
     batch_size, num_heads, q_len, hidden_size = q.shape
     _, num_head_kv, k_len, _ = k.shape
 
@@ -205,22 +235,23 @@ def tile_prefill_fmha(q: torch.Tensor, k, v, sm_scale, is_causal=True):
     query_group_size = num_heads // num_head_kv
     q2 = q.transpose(1, 2)
     assert q2.is_contiguous()
+    assert k.is_contiguous()
+    assert v.is_contiguous()
     # q = q.contiguous() if not q.is_contiguous() else q
-    k = k.contiguous() if not k.is_contiguous() else k
-    v = v.contiguous() if not v.is_contiguous() else v
+    # k = k.contiguous() if not k.is_contiguous() else k
+    # v = v.contiguous() if not v.is_contiguous() else v
     o = torch.empty_like(q2)
 
     input_pos = 0  # prefill, causal
 
-    max_tile_n = max(cfg.TILE_N for cfg in _fmha_autotune_configs())
-    EVEN_K = (k_len % max_tile_n) == 0
+    EVEN_K = (k_len % _max_tile_n) == 0
     return cutile_autotune_fmha(
         torch.cuda.current_stream(),
         q2,
         k,
         v,
         o,
-        sm_scale,
+        scaling,
         input_pos,
         hidden_size,
         num_heads,
@@ -229,15 +260,84 @@ def tile_prefill_fmha(q: torch.Tensor, k, v, sm_scale, is_causal=True):
         EVEN_K,
     )
 
+# specialized fmha_prefill for fast inference of qwen2.5-1.5b
+def fmha_prefill_fast(stream, q: torch.Tensor, k, v, scaling, is_causal=True, TILE_M=64, TILE_N=64):
+    batch_size, num_heads, q_len, hidden_size = q.shape
+    q2 = q.transpose(1, 2)
 
-def fmha_prefill(
-    q,
-    k,
-    v,
-    scaling=None,
-    is_causal=True
-):
-    if scaling is None:
-        scaling = 1.0 / math.sqrt(q.size(-1))
-    o = tile_prefill_fmha(q, k, v, scaling, is_causal)
-    return o
+    # assert num_heads % num_head_kv == 0
+    query_group_size = 6
+    # assert q2.is_contiguous()
+    # assert k.is_contiguous()
+    # assert v.is_contiguous()
+    # q = q.contiguous() if not q.is_contiguous() else q
+    # k = k.contiguous() if not k.is_contiguous() else k
+    # v = v.contiguous() if not v.is_contiguous() else v
+    o = torch.empty_like(q2)
+
+    input_pos = 0  # prefill, causal
+
+    EVEN_K = True
+    grid = (math.ceil(q_len / TILE_M), batch_size * num_heads, 1)
+    ct.launch(stream,
+            grid,  # 1D grid of processors
+            fmha_kernel,
+            (
+                q2,
+                k,
+                v,
+                o,
+                scaling,
+                input_pos,
+                hidden_size,
+                num_heads,
+                TILE_M,
+                TILE_N,
+                query_group_size,
+                is_causal,
+                EVEN_K,
+            ))
+
+
+
+
+if __name__ == "__main__":
+    # qwen2.5-1.5b
+    # q2.shape: torch.Size([1, 128, 12, 128]) k.shape: torch.Size([1, 2, 128, 128]) v.shape: torch.Size([1, 2, 128, 128])
+    # o.shape: torch.Size([1, 128, 12, 128])
+    # sm_scale: 0.08838834764831845 input_pos: 0 hidden_size: 128
+    # num_heads: 12 query_group_size: 6 is_causal: True EVEN_K: True
+    import torch
+    q2 = torch.randn((1, 128, 12, 128), dtype=torch.float16, device='cuda')
+    q = q2.transpose(1, 2)
+    k = torch.randn((1, 2, 128, 128), dtype=torch.float16, device='cuda')
+    v = torch.randn((1, 2, 128, 128), dtype=torch.float16, device='cuda')
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    import time
+    sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+
+    module =SimpleNamespace(num_key_value_groups=6)
+    # enable cuda.tile_experimental._autotuner logging for debug
+    # import logging
+    # logging.basicConfig(level=logging.DEBUG)
+    # ct_experimental._autotuner.logger.setLevel(logging.DEBUG)
+
+    stream = torch.cuda.current_stream()
+    o = fmha_prefill_fast(stream, q, k, v, scaling=0.08838834764831845, is_causal=True)
+    torch.cuda.synchronize()
+    start_time = time.time()
+    for _ in range(10):
+        o = fmha_prefill_fast(stream, q, k, v, scaling=0.08838834764831845, is_causal=True)
+    torch.cuda.synchronize()
+    end_time = time.time()
+    print(f"Time taken for fmha_prefill: {(end_time - start_time) * 1000/10} ms")
+
+    position_ids = torch.arange(128, device='cuda')
+    o = sdpa(module, q, k, v, is_causal=True, attention_mask=None, position_ids=position_ids, sliding_window=None, use_cache = True)
+    torch.cuda.synchronize()
+    start_time = time.time()
+    for _ in range(10):
+        o = sdpa(module, q, k, v, is_causal=True, attention_mask=None, position_ids=position_ids, sliding_window=None, use_cache = True)
+    torch.cuda.synchronize()
+    end_time = time.time()
+    print(f"Time taken for sdpa: {(end_time - start_time) * 1000/10} ms")
