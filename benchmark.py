@@ -15,21 +15,8 @@ setup_logging(level="INFO")
 cutile_enabled = args.enable_cutile
 
 if cutile_enabled:
-    print("Cutile enabled, trigger jit compilation")
+    print("Cutile enable")
     qwen2_mod.Qwen2Model = MyQwen2Model
-    from transformers import AutoConfig
-    config = AutoConfig.from_pretrained(model_name)
-    hidden_size = config.hidden_size  # 1536
-    intermediate_size = config.intermediate_size  # 8960
-    # mlp = MyQwen2Model(config).to('cuda')
-    # batch_size = 1
-    # seq_len = 128
-    
-    # x = torch.randn((batch_size, seq_len, hidden_size), device='cuda', dtype=torch.float16)
-    # mlp(x)
-    # x = torch.randn((batch_size, 1, hidden_size), device='cuda', dtype=torch.float16)
-    # mlp(x)
-    print("jit done")
 
 
 
