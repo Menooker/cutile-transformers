@@ -8,7 +8,7 @@ from cutile.modules.Qwen2MLP import MyQwen2MLP
 # 替换transformers中的Qwen2MLP
 qwen2_mod.Qwen2MLP = MyQwen2MLP
 
-model_name = "/home/menooker/models/Qwen2.5-1.5B"
+model_name = "Qwen/Qwen2.5-1.5B"
 
 def load_model():
     if torch.cuda.is_available():
