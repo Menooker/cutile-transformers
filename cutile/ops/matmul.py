@@ -109,7 +109,24 @@ def launch_matmul(stream: torch.cuda.Stream, a: torch.Tensor, b: torch.Tensor, c
             grid,  # 1D grid of processors
             matmul,
             (a, b, c, tile_m, tile_n, tile_k, transb, act, latencyAB, latencyC))
-    
+
+def launch_matmul_auto_tune(stream: torch.cuda.Stream, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=False, act=0):
+    M, N, K = a.shape[0], c.shape[1], a.shape[1]
+    import cuda.tile_experimental as ct_experimental
+    from types import SimpleNamespace
+    ct_experimental.autotune_launch(
+        stream,
+        grid_fn=lambda cfg: (ceil(M/cfg.tile_m) * ceil(N/cfg.tile_n), 1, 1),
+        kernel=matmul,
+        args_fn=lambda cfg: (a, b, c, cfg.tile_m, cfg.tile_n, cfg.tile_k, transb, act, cfg.latencyAB, cfg.latencyC),
+        hints_fn=lambda cfg: {
+            "occupancy": cfg.occupancy,
+        },
+        search_space=[SimpleNamespace(tile_m=TM, tile_n=TN, tile_k=TK, occupancy=occupancy, latencyAB=latencyAB, latencyC=latencyC)
+                for TM in [32, 64] for TN in [32, 64, 128] for TK in [32, 64, 128] for occupancy in [1, 2, 4, 8] for latencyAB in [1, 2, 4] for latencyC in [1, 2, 4]],
+    )
+
+
 @ct.kernel(occupancy=ct.ByTarget(sm_120=2))
 def matmul_split_k_kernel(A, B, C, LOCKS, COUNTS,
                           tm: ConstInt, tn: ConstInt, tk: ConstInt,
@@ -298,8 +315,8 @@ def test_gemv():
 
 
 if __name__ == "__main__":
-    test()
-    test_gemv()
+    # test()
+    # test_gemv()
     # tune_matmul(torch.rand((128, 8960), device='cuda', dtype=torch.float16),
     #             torch.rand((8960, 1536), device='cuda', dtype=torch.float16),
     #             torch.zeros((128, 1536), device='cuda', dtype=torch.float16),
@@ -312,6 +329,15 @@ if __name__ == "__main__":
     #             torch.zeros((128, 1536), device='cuda', dtype=torch.float16), 
     #             cfgs, launch_matmul,
     #             act=0, transb=False)
+    
+    from autotune_logger import setup_autotune_logger
+    setup_autotune_logger()
+    launch_matmul_auto_tune(torch.cuda.current_stream(),
+                            torch.rand((128, 8960), device='cuda', dtype=torch.float16),
+                            torch.rand((1536, 8960), device='cuda', dtype=torch.float16),
+                            torch.zeros((128, 1536), device='cuda', dtype=torch.float16),
+                            transb=True, act=0)
+    print("done")
 
     # tune gemv a @ b.T
     # cfgs = [{'tile_n': n, 'tile_k': k, 'split_k': splitk}  for n in [32,64,128] for k in [32,64,128] for splitk in [4,8,16]]

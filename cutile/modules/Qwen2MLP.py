@@ -40,18 +40,15 @@ def my_qwen2_mlp(
         launch_gemv_silu_mul(
             stream, xv, self.gate_proj.weight, self.up_proj.weight, intermediate_buffer, approx=True
         )
+        launch_gemv(stream, intermediate_buffer, self.down_proj.weight, output_buffer)
     else:
-        print(xv.shape, self.gate_proj.weight.shape, self.up_proj.weight.shape)
         launch_matmul_silu_mul(
             stream, xv, self.gate_proj.weight, self.up_proj.weight, intermediate_buffer, approx=True
         )
+        launch_matmul(stream, intermediate_buffer, self.down_proj.weight, output_buffer, transb=True, act=0)
         # a = torch.matmul(xv, self.gate_proj.weight.T)
         # v0 = torch.sigmoid(a) * a  * torch.matmul(xv, self.up_proj.weight.T)
-    if M == 1:
-        launch_gemv(stream, intermediate_buffer, self.down_proj.weight, output_buffer)
-    else:
-        # launch_matmul(stream, v0, self.down_proj.weight, down_proj, transb=True, act=0)
-        torch.matmul(intermediate_buffer, self.down_proj.weight.T, out=output_buffer)
+        # torch.matmul(intermediate_buffer, self.down_proj.weight.T, out=output_buffer)
     return output_buffer.view(batch_size, -1, self.hidden_size)
 
 

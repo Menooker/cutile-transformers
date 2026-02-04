@@ -2,7 +2,7 @@ import torch
 import math
 from typing import Optional
 from cutile.ops.attention_prefill import fmha_prefill
-from cutile.ops.attention_decode import fmha_decode
+from cutile.ops.attention_decode import attention_decode
 
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 old = ALL_ATTENTION_FUNCTIONS["sdpa"]
@@ -28,8 +28,8 @@ def fmha(
         scaling = 1.0 / math.sqrt(q.size(-1))
 
     if q.size(-2) == 1:
-        return old(module, q, k, v, attention_mask, dropout=dropout, scaling=scaling, is_causal=is_causal, has_backward=has_backward, **kwargs)
-        # return fmha_decode(q, k, v, sm_scale=scaling), None
+        #return old(module, q, k, v, attention_mask, dropout=dropout, scaling=scaling, is_causal=is_causal, has_backward=has_backward, **kwargs)
+        return attention_decode(stream, out, q, k, v, scaling), None
 
     # Set default values
     is_causal = True if is_causal is None else is_causal

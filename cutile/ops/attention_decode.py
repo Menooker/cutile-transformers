@@ -97,7 +97,8 @@ def attention_decode_kernel_grouped(
             # Compute qk - unconditional execution enables Tensor Core usage
             # (HEAD_DIM, QUERY_GROUP_TILE_SIZE) @ (TILE_N, HEAD_DIM).T
             # Result: (TILE_N, QUERY_GROUP_TILE_SIZE)
-            qk = ct.matmul(k, q)
+            qk = ct.full((TILE_N, QUERY_GROUP_TILE_SIZE), 0.0, dtype=ct.float32)
+            qk = ct.mma(k, q, qk)
 
             # Process boundary case (non-causal) - apply mask to result only
             if curr_n + TILE_N > S_kv:
@@ -174,8 +175,8 @@ def attention_decode_kernel_grouped(
         latency=1,
     )
 
-
-def attention_decode(Q, K, V, softmax_scale, kv_len_per_split=None):
+NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+def attention_decode(stream: torch.cuda.Stream, out: torch.Tensor, Q, K, V, softmax_scale, kv_len_per_split=None):
         """
         Grouped Query Attention implementation using attention_decode_kernel_grouped.
         Supports both standard attention (num_q_heads == num_kv_heads) and
@@ -204,7 +205,6 @@ def attention_decode(Q, K, V, softmax_scale, kv_len_per_split=None):
         # Calculate number of tiles
         TILE_N = 128
         if kv_len_per_split is None:
-            NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
             NUM_KV_SPLITS = NUM_SMS // (batch_size * num_kv_heads)
             TILE_SIZE = max(
                 TILE_N,
@@ -229,9 +229,6 @@ def attention_decode(Q, K, V, softmax_scale, kv_len_per_split=None):
             device=device,
             dtype=torch.float32,
         )
-
-        # Prepare output
-        O = torch.empty_like(Q)
 
         # Calculate grouped attention parameters
         assert num_q_heads % num_kv_heads == 0
@@ -279,7 +276,7 @@ def attention_decode(Q, K, V, softmax_scale, kv_len_per_split=None):
         grid = (batch_size, num_kv_heads, NUM_KV_SPLITS)
 
         ct.launch(
-            torch.cuda.current_stream(),
+            stream,
             grid,
             attention_decode_kernel_grouped,
             (
@@ -308,12 +305,6 @@ def attention_decode(Q, K, V, softmax_scale, kv_len_per_split=None):
         )
 
         # Reduce kernel splitk results
-        splitk_reduce(Att_Mid_Out, LSE_Out, O, seq_len)
+        splitk_reduce(stream, Att_Mid_Out, LSE_Out, out.view(batch_size, num_q_heads, head_dim), seq_len)
 
-        return O.view(batch_size, num_q_heads, 1, head_dim)
-
-def fmha_decode(q, k, v, sm_scale, kv_len_per_split=None, **kwargs):
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(q.size(-1))
-    o = attention_decode(q, k, v, sm_scale, kv_len_per_split)
-    return o
+        return out

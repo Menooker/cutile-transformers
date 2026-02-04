@@ -96,7 +96,7 @@ def splitk_reduce_kernel(
     )
 
 
-def splitk_reduce(attn_splitk_out, lse_splitk_out, attn_out, S_kv, **kwargs):
+def splitk_reduce(stream: torch.cuda.Stream, attn_splitk_out, lse_splitk_out, attn_out, S_kv, **kwargs):
     """
     Reduce the intermediate attention results and lse results into the final output for attention decode
     Args:
@@ -117,7 +117,7 @@ def splitk_reduce(attn_splitk_out, lse_splitk_out, attn_out, S_kv, **kwargs):
 
     # Launch kernel
     ct.launch(
-        torch.cuda.current_stream(),
+        stream,
         grid,
         splitk_reduce_kernel,
         (
